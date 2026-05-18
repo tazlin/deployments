@@ -154,6 +154,10 @@ jobs:
             target: model_reference/test_model_reference_render
             jobs: 1
             timeout_minutes: 15
+          - name: service_alerts
+            target: service_alerts/test_service_alerts_render
+            jobs: 1
+            timeout_minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -226,6 +230,10 @@ jobs:
             timeout_minutes: 10
           - name: model_reference
             target: model_reference/test_model_reference_render
+            jobs: 1
+            timeout_minutes: 15
+          - name: service_alerts
+            target: service_alerts/test_service_alerts_render
             jobs: 1
             timeout_minutes: 15
 

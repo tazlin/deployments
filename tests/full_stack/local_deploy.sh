@@ -13,9 +13,11 @@
 #   ./tests/full_stack/local_deploy.sh up --with-worker       # + GPU worker
 #   ./tests/full_stack/local_deploy.sh up --latest            # follow default branches instead of pinned SHAs
 #   ./tests/full_stack/local_deploy.sh up --all               # everything
+#   ./tests/full_stack/local_deploy.sh up --local-ai-horde ../AI-Horde  # sync a local checkout; must support telemetry-profiling
 #   ./tests/full_stack/local_deploy.sh down
 #   ./tests/full_stack/local_deploy.sh status
 #   ./tests/full_stack/local_deploy.sh logs [service]
+# Risk category: deploy-safety, operational
 
 set -euo pipefail
 
@@ -82,17 +84,21 @@ fi
 # Override via env or the --local-ai-horde / --local-frontpage flags.
 AI_HORDE_LOCAL_SRC="${AI_HORDE_LOCAL_SRC:-}"
 FRONTPAGE_LOCAL_SRC="${FRONTPAGE_LOCAL_SRC:-}"
+AI_HORDE_PROFILING_DEPENDENCY_GROUP="telemetry-profiling"
 
 
 # Each tier has its own wrapper so that the compose project name and
 # file list are consistent across up / down / status / logs.
 
 dc_backend() {
-  docker compose \
-    -f "$LOCAL_ROOT/ai-horde/docker-compose.yml" \
-    -f "$STATIC_ROOT/ai-horde/docker-compose.network-overlay.yml" \
-    --project-name horde-aihorde \
-    "$@"
+  local args=(
+    -f "$LOCAL_ROOT/ai-horde/docker-compose.yml"
+    -f "$STATIC_ROOT/ai-horde/docker-compose.network-overlay.yml"
+  )
+  if [ "$WITH_MONITORING" != true ] && [ -f "$LOCAL_ROOT/ai-horde/docker-compose.garage.yml" ]; then
+    args+=(-f "$LOCAL_ROOT/ai-horde/docker-compose.garage.yml")
+  fi
+  docker compose "${args[@]}" --project-name horde-aihorde "$@"
 }
 
 dc_frontpage() {
@@ -204,7 +210,7 @@ check_fullstack_prerequisites() {
   check_prerequisites git ss
 
   # Port conflict detection
-  local core_ports=(80 8006 8088 8404 19800)
+  local core_ports=(80 3900 3903 8006 19810 8404 19800)
   for port in "${core_ports[@]}"; do
     if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
       err "Port $port is already in use."
@@ -315,6 +321,8 @@ clone_sources() {
     _patch_dockerfile "$LOCAL_ROOT/ai-horde/src/Dockerfile"
   fi
 
+  validate_local_ai_horde_profiling_support
+
   # AiHordeFrontpage source
   if [ -n "$FRONTPAGE_LOCAL_SRC" ]; then
     sync_local_source "$FRONTPAGE_LOCAL_SRC" "$LOCAL_ROOT/frontpage/src" "AiHordeFrontpage"
@@ -331,6 +339,30 @@ clone_sources() {
       "https://github.com/Haidra-Org/artbot.git" \
       "$LOCAL_ROOT/artbot/src" \
       "$artbot_ref"
+  fi
+}
+
+validate_local_ai_horde_profiling_support() {
+  if [ -z "$AI_HORDE_LOCAL_SRC" ]; then
+    return 0
+  fi
+
+  local source_dir="$LOCAL_ROOT/ai-horde/src"
+  local pyproject="$source_dir/pyproject.toml"
+  local dockerfile="$source_dir/Dockerfile"
+
+  if ! grep -q "$AI_HORDE_PROFILING_DEPENDENCY_GROUP" "$pyproject" 2>/dev/null; then
+    err "--local-ai-horde source is missing pyproject dependency group: $AI_HORDE_PROFILING_DEPENDENCY_GROUP"
+    err "Local full-stack deploy enables PYROSCOPE_ENABLED=true and builds with that dependency group."
+    err "Point --local-ai-horde at a checkout containing the profiling optional dependency changes."
+    exit 1
+  fi
+
+  if ! grep -q "AI_HORDE_DEPENDENCY_GROUPS" "$dockerfile" 2>/dev/null; then
+    err "--local-ai-horde source Dockerfile does not accept AI_HORDE_DEPENDENCY_GROUPS."
+    err "Without that build arg, the local image can start with PYROSCOPE_ENABLED=true but no Pyroscope package installed."
+    err "Point --local-ai-horde at a checkout containing the profiling Dockerfile changes."
+    exit 1
   fi
 }
 
@@ -448,37 +480,43 @@ probe_otlp_native_histograms() {
   done
   log "  primed 20 requests"
 
-  # 3. Wait for ingestion (alloy batch=5s + deltatocumulative + mimir flush).
-  info "Probe: waiting 30s for OTLP ingestion to flush"
-  sleep 30
-
-  # 4. Native-histogram probe — query the series API for any duration
-  #    histogram known to be emitted by either logfire's flask
-  #    auto-instrumentation (`http_server_duration_*`,
-  #    `http_server_request_duration_*`) or our explicit horde_*_duration
-  #    instruments.  We use /series rather than /query to avoid having to
-  #    pick the "right" exact name — the goal is just to confirm SOMETHING
-  #    landed in this tenant from the OTLP pipeline.  Tempo span-metrics /
-  #    service-graph series are excluded by the regex anchor.
+  # 3+4. Poll Mimir for series — retry every 10s for up to 90s.
+  #
+  #  Why a retry loop instead of a fixed sleep:
+  #    - OTEL_METRIC_EXPORT_INTERVAL=10s (set in local_deploy.yml) means the
+  #      first batch lands within ~10-15s of the priming requests.
+  #    - alloy batches at 5s; Mimir makes OTLP pushes immediately queryable.
+  #    - If the SDK had to reconnect after a startup delay (alloy joins
+  #      horde-stack in tier 3, after aihorde starts in tier 1), the first
+  #      successful export may arrive later than the nominal 10s interval.
+  #    - 90s total ceiling covers worst-case SDK reconnect + one full export
+  #      cycle even without the shortened interval.
+  #
+  #  We use /series rather than /query to avoid having to pick the "right"
+  #  exact name — the goal is just to confirm SOMETHING landed in this tenant
+  #  from the OTLP pipeline.  Tempo span-metrics / service-graph series are
+  #  excluded by the regex anchor.
   local match='{__name__=~"(http_server|horde_).+_duration(_bucket|_sum|_count)?"}'
   info "Probe: series matching ${match}"
-  local response
-  response=$(curl -sf -G \
-      -H "X-Scope-OrgID: ${tenant}" \
-      --data-urlencode "match[]=${match}" \
-      --data-urlencode "start=$(date -u -d '10 min ago' +%s)" \
-      --data-urlencode "end=$(date -u +%s)" \
-      --max-time 15 \
-      "${mimir_url}/prometheus/api/v1/series" 2>/dev/null || true)
-  if [ -z "$response" ]; then
-    err "  Empty response from Mimir."
-    return 1
-  fi
+  local has_data response
+  local _deadline=$(( $(date +%s) + 90 ))
+  while true; do
+    sleep 10
+    response=$(curl -sf -G \
+        -H "X-Scope-OrgID: ${tenant}" \
+        --data-urlencode "match[]=${match}" \
+        --data-urlencode "start=$(date -u -d '10 min ago' +%s)" \
+        --data-urlencode "end=$(date -u +%s)" \
+        --max-time 15 \
+        "${mimir_url}/prometheus/api/v1/series" 2>/dev/null || true)
+    if [ -z "$response" ]; then
+      err "  Empty response from Mimir."
+      return 1
+    fi
 
-  # Use python3 with .format() (no f-string escapes — those break under
-  # `python3 -c '...'` single-quoted bash invocation pre-3.12).
-  local has_data
-  has_data=$(printf '%s' "$response" | python3 -c '
+    # Use python3 with .format() (no f-string escapes — those break under
+    # `python3 -c '...'` single-quoted bash invocation pre-3.12).
+    has_data=$(printf '%s' "$response" | python3 -c '
 import json, sys
 try:
     body = json.load(sys.stdin)
@@ -496,32 +534,39 @@ else:
     print("OK:{}:{}".format(len(result), ",".join(names[:8])))
 ' 2>&1 || echo "PYERR")
 
-  case "$has_data" in
-    OK:*)
-      log "  OTLP histograms present in tenant (${has_data#OK:})"
-      ;;
-    EMPTY)
-      err "  Mimir returned status=success but no series matched ${match}"
-      err "  This means no OTLP duration histograms reached Mimir for this tenant."
-      err "  Inspect with:"
-      err "    curl -H 'X-Scope-OrgID: ${tenant}' '${mimir_url}/prometheus/api/v1/label/__name__/values'"
-      return 1
-      ;;
-    STATUS:*)
-      err "  Mimir query failed: ${has_data#STATUS:}"
-      return 1
-      ;;
-    PARSE_ERROR:*)
-      err "  JSON parse failure: ${has_data#PARSE_ERROR:}"
-      err "  Raw response: ${response:0:500}"
-      return 1
-      ;;
-    *)
-      err "  Unexpected response shape: ${has_data}"
-      err "  Raw response: ${response:0:500}"
-      return 1
-      ;;
-  esac
+    case "$has_data" in
+      OK:*)
+        log "  OTLP histograms present in tenant (${has_data#OK:})"
+        break
+        ;;
+      EMPTY)
+        if [ $(date +%s) -lt $_deadline ]; then
+          local _remaining=$(( _deadline - $(date +%s) ))
+          info "  Not yet — retrying (${_remaining}s remaining) ..."
+          continue
+        fi
+        err "  No OTLP duration histograms reached Mimir after 90s."
+        err "  This means no OTLP duration histograms reached Mimir for this tenant."
+        err "  Inspect with:"
+        err "    curl -H 'X-Scope-OrgID: ${tenant}' '${mimir_url}/prometheus/api/v1/label/__name__/values'"
+        return 1
+        ;;
+      STATUS:*)
+        err "  Mimir query failed: ${has_data#STATUS:}"
+        return 1
+        ;;
+      PARSE_ERROR:*)
+        err "  JSON parse failure: ${has_data#PARSE_ERROR:}"
+        err "  Raw response: ${response:0:500}"
+        return 1
+        ;;
+      *)
+        err "  Unexpected response shape: ${has_data}"
+        err "  Raw response: ${response:0:500}"
+        return 1
+        ;;
+    esac
+  done
 
   log "OTLP native-histogram smoke test passed."
 }
@@ -650,6 +695,13 @@ cmd_up() {
   log "═══ Tier 1: AI-Horde Backend ═══"
   log "Building AI-Horde Docker image ..."
   dc_backend build
+  if [ "$WITH_MONITORING" != true ] && [ -f "$LOCAL_ROOT/ai-horde/docker-compose.garage.yml" ]; then
+    log "Starting local Garage for AI-Horde R2/source-image storage ..."
+    cleanup_known_container_name_conflicts horde-aihorde s3-store
+    load_env "$LOCAL_ROOT/ai-horde/local-deploy.env"
+    dc_backend up -d s3-store
+    bootstrap_embedded_garage
+  fi
   log "Starting AI-Horde backend ..."
   dc_backend up -d --scale aihorde="$INSTANCES"
   wait_for_url "http://127.0.0.1:7001/api/v2/status/heartbeat" "AI-Horde" 300 || {
@@ -679,6 +731,17 @@ cmd_up() {
   wait_for_url "http://127.0.0.1:19800/api/heartbeat" "horde-model-reference" 120 || {
     err "horde-model-reference did not start. Dumping logs:"
     dc_model_reference logs --tail=50
+    return 1
+  }
+  echo ""
+
+  # Tier 2c: Service Alerts (ai-horde-service-alerts)
+  log "═══ Tier 2c: ai-horde-service-alerts ═══"
+  log "Starting ai-horde-service-alerts ..."
+  dc_service_alerts up -d
+  wait_for_url "http://127.0.0.1:19810/healthz" "ai-horde-service-alerts" 60 || {
+    err "ai-horde-service-alerts did not start. Dumping logs:"
+    dc_service_alerts logs --tail=50
     return 1
   }
   echo ""
@@ -751,6 +814,17 @@ cmd_up() {
     dc_haproxy logs --tail=50
     return 1
   }
+  # The wait above returns as soon as the frontpage backend (aihorde_frontend)
+  # answers.  The API backend (horde_client_api) uses server-template with
+  # async DNS resolvers, so its health-check cycle starts separately and can
+  # lag by a few seconds.  Wait explicitly so the probe below doesn't race
+  # against a backend that hasn't yet passed its first check cycle.
+  wait_for_url "http://127.0.0.1:80/api/v2/status/heartbeat" "HAProxy → AI-Horde API backend" 30 || {
+    err "HAProxy API backend did not become ready within 30s."
+    err "  Check backend status at: http://localhost:8404/stats"
+    dc_haproxy logs --tail=20
+    return 1
+  }
   echo ""
 
   # Connectivity probes
@@ -810,6 +884,7 @@ cmd_down() {
   dc_haproxy down --remove-orphans 2>/dev/null || true
   dc_monitoring down --remove-orphans 2>/dev/null || true
   dc_model_reference down --remove-orphans 2>/dev/null || true
+  dc_service_alerts down --remove-orphans 2>/dev/null || true
   dc_frontpage down --remove-orphans 2>/dev/null || true
   dc_backend down --remove-orphans 2>/dev/null || true
 
@@ -830,6 +905,9 @@ cmd_status() {
   echo ""
   info "─── horde-model-reference ───"
   dc_model_reference ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "  (not running)"
+  echo ""
+  info "─── ai-horde-service-alerts ───"
+  dc_service_alerts ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "  (not running)"
   echo ""
   info "─── HAProxy ───"
   dc_haproxy ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "  (not running)"
@@ -855,6 +933,9 @@ cmd_logs() {
     model-reference|models)
       dc_model_reference logs -f --tail=100
       ;;
+    service-alerts|alerts)
+      dc_service_alerts logs -f --tail=100
+      ;;
     haproxy)
       dc_haproxy logs -f --tail=100
       ;;
@@ -874,6 +955,8 @@ cmd_logs() {
       dc_frontpage logs --tail=20 2>/dev/null || true
       echo "---"
       dc_model_reference logs --tail=20 2>/dev/null || true
+      echo "---"
+      dc_service_alerts logs --tail=20 2>/dev/null || true
       echo "---"
       dc_haproxy logs --tail=20 2>/dev/null || true
       ;;
@@ -996,6 +1079,7 @@ main() {
       ;;
     *)
       echo "Usage: $0 {up|down|status|logs} [--with-monitoring] [--with-worker] [--with-artbot] [--latest] [--all] [--instances=N] [--local-ai-horde PATH] [--local-frontpage PATH] [-e key=value]"
+      echo "       --local-ai-horde PATH must point at a checkout whose Dockerfile supports AI_HORDE_DEPENDENCY_GROUPS and telemetry-profiling."
       exit 1
       ;;
   esac
