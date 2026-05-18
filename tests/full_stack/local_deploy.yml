@@ -8,6 +8,7 @@
 #
 # The HAProxy config is a static file (local-deploy/static/haproxy/haproxy.cfg)
 # and does not need to be rendered here.
+# Risk category: deploy-safety, operational
 
 - name: Render complete Horde stack configs (local deploy)
   hosts: localhost
@@ -26,16 +27,18 @@
     # `dc_backend build`. Without this, the compose only references
     # `image:` and the build step is a no-op.
     ai_horde_build_context: "./src"
+    ai_horde_build_dependency_groups:
+      - telemetry-profiling
     # Tag the locally-built image with a -local suffix so it can never be
     # overwritten by a `docker pull` from the registry.
     ai_horde_image: "ai-horde:local"
 
-    # Garage S3 credentials are rendered into runtime/ai-horde/.env.garage
-    # by local_deploy.sh after the embedded Garage bootstrap completes.
-    # Loaded as a second env_file with required:false so the stack still
-    # boots cleanly when monitoring (and therefore Garage) is disabled.
+    # Garage S3 credentials are rendered into runtime/ai-horde/.env.garage.
+    # Monitoring-enabled full-stack runs may overwrite this with the
+    # monitoring Garage credentials after that stack has bootstrapped.
     ai_horde_extra_env_files:
       - .env.garage
+    local_garage_attach_horde_stack: true
 
     ai_horde_start_services: false
     ai_horde_log_driver: "local"
@@ -63,6 +66,9 @@
       KUDOS_TRUST_THRESHOLD: "100"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alloy:4318"
       PYROSCOPE_SERVER_ADDRESS: "http://pyroscope:4040"
+      # Flush metrics every 10 s so the OTLP smoke-test probe doesn't have to
+      # wait for the 60 s production default before querying Mimir.
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
 
     aihorde_frontpage_start_services: false
     aihorde_frontpage_build_config: local
@@ -84,12 +90,38 @@
     horde_model_reference_port: 19800
     horde_model_reference_log_driver: "local"
 
+    horde_service_alerts_base_dir: "{{ playbook_dir }}/../../local-deploy/runtime/service-alerts"
+    horde_service_alerts_start_services: false
+    horde_service_alerts_listen: "127.0.0.1"
+    horde_service_alerts_port: 19810
+    horde_service_alerts_log_driver: "local"
+    # In local-deploy, monitoring runs as sibling containers attached to the
+    # shared `horde-stack` network.  Override the upstream URLs so the
+    # service-alerts container reaches them by service name (and only when
+    # the operator has actually enabled --with-monitoring; the role tolerates
+    # unreachable upstreams via /healthz).
+    horde_service_alerts_alertmanager_base_url: "http://alertmanager:9093"
+    horde_service_alerts_mimir_base_url: "http://mimir:9009"
+
   roles:
     - ai_horde
     - aihorde_frontpage
     - horde_model_reference
+    - horde_service_alerts
 
   post_tasks:
+    - name: Render local Garage for AI-Horde R2/source-image storage
+      ansible.builtin.import_tasks: ../local_garage.yml
+
+    - name: Render AI-Horde local-deploy.env
+      ansible.builtin.copy:
+        content: |
+          AI_HORDE_PORT={{ ai_horde_port }}
+          AI_HORDE_BASE_DIR={{ ai_horde_base_dir }}
+          {{ local_garage_local_deploy_env }}
+        dest: "{{ ai_horde_base_dir }}/local-deploy.env"
+        mode: "0644"
+
     - name: Ensure HAProxy config directory exists
       ansible.builtin.file:
         path: "{{ playbook_dir }}/../../local-deploy/static/haproxy"
